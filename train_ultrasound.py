@@ -19,8 +19,10 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
-from torch.amp import GradScaler, autocast
+from torch.amp.grad_scaler import GradScaler
+from torch.amp.autocast_mode import autocast
 from tqdm import tqdm
+import torchvision.utils as vutils
 
 from Models import U_Net
 from ultrasound_dataset import set_seed, get_dataloaders, get_kfold_dataloaders
@@ -85,6 +87,51 @@ class EarlyStopping:
                 self.early_stop = True
 
         return self.early_stop
+
+
+@torch.no_grad()
+def visualize_predictions(model, loader, device, writer, epoch, num_samples=4):
+    """Visualize segmentation predictions on validation samples."""
+    model.eval()
+
+    # Get a batch of samples
+    batch = next(iter(loader))
+    images = batch['image'][:num_samples].to(device)
+    masks = batch['mask'][:num_samples].to(device)
+
+    # Get predictions
+    outputs = model(images)
+    preds = torch.sigmoid(outputs)
+    preds_binary = (preds > 0.5).float()
+
+    # Denormalize images for visualization (assuming ImageNet normalization)
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+    images_denorm = images * std + mean
+    images_denorm = torch.clamp(images_denorm, 0, 1)
+
+    # Create visualization grid: [image, ground truth, prediction, overlay]
+    vis_list = []
+    for i in range(num_samples):
+        img = images_denorm[i]  # [3, H, W]
+        gt = masks[i].expand(3, -1, -1)  # [3, H, W]
+        pred = preds_binary[i].expand(3, -1, -1)  # [3, H, W]
+
+        # Create overlay: green for correct, red for false positive, blue for false negative
+        overlay = img.clone()
+        tp = (preds_binary[i] == 1) & (masks[i] == 1)  # True positive - green
+        fp = (preds_binary[i] == 1) & (masks[i] == 0)  # False positive - red
+        fn = (preds_binary[i] == 0) & (masks[i] == 1)  # False negative - blue
+
+        overlay[1] = torch.where(tp.squeeze(), torch.ones_like(overlay[1]) * 0.8, overlay[1])
+        overlay[0] = torch.where(fp.squeeze(), torch.ones_like(overlay[0]) * 0.8, overlay[0])
+        overlay[2] = torch.where(fn.squeeze(), torch.ones_like(overlay[2]) * 0.8, overlay[2])
+
+        vis_list.extend([img, gt, pred, overlay])
+
+    # Create grid: 4 columns (image, gt, pred, overlay) x num_samples rows
+    grid = vutils.make_grid(vis_list, nrow=4, normalize=False, padding=2)
+    writer.add_image('Predictions/val_samples', grid, epoch)
 
 
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch):
@@ -253,6 +300,10 @@ def train(args):
         writer.add_scalars('Dice', {'train': train_dice, 'val': val_dice}, epoch)
         writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
 
+        # Visualize predictions periodically
+        if epoch % args.vis_freq == 0 or epoch == 1:
+            visualize_predictions(model, val_loader, device, writer, epoch)
+
         # Save best model
         if val_dice > best_dice:
             best_dice = val_dice
@@ -310,7 +361,7 @@ def train_kfold(args):
     fold_results = []
 
     # K-Fold training
-    for fold_idx, train_loader, val_loader, test_loader in get_kfold_dataloaders(
+    for fold_idx, train_loader, val_loader, _ in get_kfold_dataloaders(
         train_dirs=train_dirs,
         test_dir=args.test_dir,
         n_folds=args.n_folds,
@@ -377,6 +428,10 @@ def train_kfold(args):
 
             writer.add_scalars('Loss', {'train': train_loss, 'val': val_loss}, epoch)
             writer.add_scalars('Dice', {'train': train_dice, 'val': val_dice}, epoch)
+
+            # Visualize predictions periodically
+            if epoch % args.vis_freq == 0 or epoch == 1:
+                visualize_predictions(model, val_loader, device, writer, epoch)
 
             if val_dice > best_dice:
                 best_dice = val_dice
@@ -464,6 +519,8 @@ def get_args():
                         help='Early stopping patience')
     parser.add_argument('--save-freq', type=int, default=10,
                         help='Save checkpoint every N epochs')
+    parser.add_argument('--vis-freq', type=int, default=5,
+                        help='Visualize predictions every N epochs')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility')
 
