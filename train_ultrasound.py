@@ -90,9 +90,13 @@ class EarlyStopping:
 
 
 @torch.no_grad()
-def visualize_predictions(model, loader, device, writer, epoch, num_samples=4):
+def visualize_predictions(model, loader, device, save_dir, epoch, num_samples=4):
     """Visualize segmentation predictions on validation samples."""
     model.eval()
+
+    # Create visualization directory
+    vis_dir = Path(save_dir) / 'visualizations'
+    vis_dir.mkdir(exist_ok=True)
 
     # Get a batch of samples
     batch = next(iter(loader))
@@ -131,7 +135,11 @@ def visualize_predictions(model, loader, device, writer, epoch, num_samples=4):
 
     # Create grid: 4 columns (image, gt, pred, overlay) x num_samples rows
     grid = vutils.make_grid(vis_list, nrow=4, normalize=False, padding=2)
-    writer.add_image('Predictions/val_samples', grid, epoch)
+
+    # Save to file
+    save_path = vis_dir / f'epoch_{epoch:03d}.png'
+    vutils.save_image(grid, save_path)
+    logging.info(f'Saved visualization to {save_path}')
 
 
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch):
@@ -302,7 +310,7 @@ def train(args):
 
         # Visualize predictions periodically
         if epoch % args.vis_freq == 0 or epoch == 1:
-            visualize_predictions(model, val_loader, device, writer, epoch)
+            visualize_predictions(model, val_loader, device, output_dir, epoch)
 
         # Save best model
         if val_dice > best_dice:
@@ -431,7 +439,7 @@ def train_kfold(args):
 
             # Visualize predictions periodically
             if epoch % args.vis_freq == 0 or epoch == 1:
-                visualize_predictions(model, val_loader, device, writer, epoch)
+                visualize_predictions(model, val_loader, device, fold_dir, epoch)
 
             if val_dice > best_dice:
                 best_dice = val_dice
