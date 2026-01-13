@@ -97,9 +97,20 @@ class EarlyStopping:
 class TxtLogger:
     """Simple TXT logger for training metrics."""
 
-    def __init__(self, log_path):
+    def __init__(self, log_path, args=None):
         self.log_path = Path(log_path)
         self.file = open(self.log_path, 'w')
+
+        # Write training configuration
+        if args is not None:
+            self.file.write('=' * 60 + '\n')
+            self.file.write('Training Configuration\n')
+            self.file.write('=' * 60 + '\n')
+            for key, value in vars(args).items():
+                self.file.write(f'{key}: {value}\n')
+            self.file.write('=' * 60 + '\n\n')
+
+        # Write header for metrics
         self.file.write('epoch\ttrain_loss\ttrain_dice\tval_loss\tval_dice\tlr\n')
         self.file.flush()
 
@@ -268,7 +279,7 @@ def train(args):
     checkpoint_dir.mkdir(exist_ok=True)
 
     # Setup TXT logger
-    logger = TxtLogger(output_dir / 'training_log.txt')
+    logger = TxtLogger(output_dir / 'training_log.txt', args=args)
 
     # Setup wandb
     use_wandb = args.wandb and WANDB_AVAILABLE
@@ -467,7 +478,7 @@ def train_kfold(args):
         checkpoint_dir.mkdir(exist_ok=True)
 
         # Setup TXT logger for this fold
-        logger = TxtLogger(fold_dir / 'training_log.txt')
+        logger = TxtLogger(fold_dir / 'training_log.txt', args=args)
 
         # Create model (fresh for each fold)
         model = U_Net(in_ch=3, out_ch=1)
