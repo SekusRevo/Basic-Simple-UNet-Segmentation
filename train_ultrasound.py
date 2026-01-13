@@ -7,7 +7,7 @@ Features:
 - Mixed precision training (AMP)
 - Dice + BCE combined loss
 - Early stopping
-- Comprehensive logging with TensorBoard
+- Wandb logging and visualization
 - Model checkpointing
 """
 
@@ -18,11 +18,16 @@ from datetime import datetime
 
 import torch
 import torch.nn as nn
-from torch.utils.tensorboard import SummaryWriter
 from torch.amp.grad_scaler import GradScaler
 from torch.amp.autocast_mode import autocast
 from tqdm import tqdm
 import torchvision.utils as vutils
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 from Models import U_Net
 from ultrasound_dataset import set_seed, get_dataloaders, get_kfold_dataloaders
@@ -89,8 +94,25 @@ class EarlyStopping:
         return self.early_stop
 
 
+class TxtLogger:
+    """Simple TXT logger for training metrics."""
+
+    def __init__(self, log_path):
+        self.log_path = Path(log_path)
+        self.file = open(self.log_path, 'w')
+        self.file.write('epoch\ttrain_loss\ttrain_dice\tval_loss\tval_dice\tlr\n')
+        self.file.flush()
+
+    def log(self, epoch, train_loss, train_dice, val_loss, val_dice, lr):
+        self.file.write(f'{epoch}\t{train_loss:.6f}\t{train_dice:.6f}\t{val_loss:.6f}\t{val_dice:.6f}\t{lr:.8f}\n')
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
+
 @torch.no_grad()
-def visualize_predictions(model, loader, device, save_dir, epoch, num_samples=4):
+def visualize_predictions(model, loader, device, save_dir, epoch, num_samples=4, use_wandb=False):
     """Visualize segmentation predictions on validation samples."""
     model.eval()
 
@@ -116,6 +138,7 @@ def visualize_predictions(model, loader, device, save_dir, epoch, num_samples=4)
 
     # Create visualization grid: [image, ground truth, prediction, overlay]
     vis_list = []
+    wandb_images = []
     for i in range(num_samples):
         img = images_denorm[i]  # [3, H, W]
         gt = masks[i].expand(3, -1, -1)  # [3, H, W]
@@ -133,6 +156,17 @@ def visualize_predictions(model, loader, device, save_dir, epoch, num_samples=4)
 
         vis_list.extend([img, gt, pred, overlay])
 
+        # Prepare wandb images
+        if use_wandb and WANDB_AVAILABLE:
+            wandb_images.append(wandb.Image(
+                img.cpu(),
+                masks={
+                    "ground_truth": {"mask_data": masks[i].squeeze().cpu().numpy()},
+                    "prediction": {"mask_data": preds_binary[i].squeeze().cpu().numpy()}
+                },
+                caption=f"Sample {i+1}"
+            ))
+
     # Create grid: 4 columns (image, gt, pred, overlay) x num_samples rows
     grid = vutils.make_grid(vis_list, nrow=4, normalize=False, padding=2)
 
@@ -140,6 +174,13 @@ def visualize_predictions(model, loader, device, save_dir, epoch, num_samples=4)
     save_path = vis_dir / f'epoch_{epoch:03d}.png'
     vutils.save_image(grid, save_path)
     logging.info(f'Saved visualization to {save_path}')
+
+    # Log to wandb
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.log({
+            "predictions": wandb_images,
+            "prediction_grid": wandb.Image(grid.cpu(), caption=f"Epoch {epoch}")
+        }, step=epoch)
 
 
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch):
@@ -226,8 +267,21 @@ def train(args):
     checkpoint_dir = output_dir / 'checkpoints'
     checkpoint_dir.mkdir(exist_ok=True)
 
-    # Setup TensorBoard
-    writer = SummaryWriter(output_dir / 'logs')
+    # Setup TXT logger
+    logger = TxtLogger(output_dir / 'training_log.txt')
+
+    # Setup wandb
+    use_wandb = args.wandb and WANDB_AVAILABLE
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=f'run_{timestamp}',
+            config=vars(args),
+            dir=output_dir
+        )
+        logging.info('Wandb initialized')
+    elif args.wandb and not WANDB_AVAILABLE:
+        logging.warning('Wandb requested but not installed. Install with: pip install wandb')
 
     # Parse training directories
     train_dirs = args.train_dirs.split(',')
@@ -304,13 +358,22 @@ def train(args):
         logging.info(f'Train Loss: {train_loss:.4f}, Train Dice: {train_dice:.4f}')
         logging.info(f'Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}')
 
-        writer.add_scalars('Loss', {'train': train_loss, 'val': val_loss}, epoch)
-        writer.add_scalars('Dice', {'train': train_dice, 'val': val_dice}, epoch)
-        writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
+        logger.log(epoch, train_loss, train_dice, val_loss, val_dice, optimizer.param_groups[0]['lr'])
+
+        # Log to wandb
+        if use_wandb:
+            wandb.log({
+                'train/loss': train_loss,
+                'train/dice': train_dice,
+                'val/loss': val_loss,
+                'val/dice': val_dice,
+                'lr': optimizer.param_groups[0]['lr'],
+                'epoch': epoch
+            }, step=epoch)
 
         # Visualize predictions periodically
         if epoch % args.vis_freq == 0 or epoch == 1:
-            visualize_predictions(model, val_loader, device, output_dir, epoch)
+            visualize_predictions(model, val_loader, device, output_dir, epoch, use_wandb=use_wandb)
 
         # Save best model
         if val_dice > best_dice:
@@ -336,7 +399,9 @@ def train(args):
     # Save final model
     torch.save(model.state_dict(), checkpoint_dir / 'final_model.pth')
 
-    writer.close()
+    logger.close()
+    if use_wandb:
+        wandb.finish()
     logging.info(f'\nTraining completed! Best validation Dice: {best_dice:.4f}')
     logging.info(f'Results saved to: {output_dir}')
 
@@ -359,6 +424,19 @@ def train_kfold(args):
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     output_dir = Path(args.output_dir) / f'kfold_{timestamp}'
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Setup wandb
+    use_wandb = args.wandb and WANDB_AVAILABLE
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=f'kfold_{timestamp}',
+            config=vars(args),
+            dir=output_dir
+        )
+        logging.info('Wandb initialized')
+    elif args.wandb and not WANDB_AVAILABLE:
+        logging.warning('Wandb requested but not installed. Install with: pip install wandb')
 
     # Parse training directories
     train_dirs = args.train_dirs.split(',')
@@ -388,8 +466,8 @@ def train_kfold(args):
         checkpoint_dir = fold_dir / 'checkpoints'
         checkpoint_dir.mkdir(exist_ok=True)
 
-        # Setup TensorBoard for this fold
-        writer = SummaryWriter(fold_dir / 'logs')
+        # Setup TXT logger for this fold
+        logger = TxtLogger(fold_dir / 'training_log.txt')
 
         # Create model (fresh for each fold)
         model = U_Net(in_ch=3, out_ch=1)
@@ -434,12 +512,22 @@ def train_kfold(args):
             logging.info(f'Train Loss: {train_loss:.4f}, Train Dice: {train_dice:.4f}')
             logging.info(f'Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}')
 
-            writer.add_scalars('Loss', {'train': train_loss, 'val': val_loss}, epoch)
-            writer.add_scalars('Dice', {'train': train_dice, 'val': val_dice}, epoch)
+            logger.log(epoch, train_loss, train_dice, val_loss, val_dice, optimizer.param_groups[0]['lr'])
+
+            # Log to wandb
+            if use_wandb:
+                wandb.log({
+                    f'fold_{fold_idx+1}/train_loss': train_loss,
+                    f'fold_{fold_idx+1}/train_dice': train_dice,
+                    f'fold_{fold_idx+1}/val_loss': val_loss,
+                    f'fold_{fold_idx+1}/val_dice': val_dice,
+                    'lr': optimizer.param_groups[0]['lr'],
+                    'epoch': epoch
+                })
 
             # Visualize predictions periodically
             if epoch % args.vis_freq == 0 or epoch == 1:
-                visualize_predictions(model, val_loader, device, fold_dir, epoch)
+                visualize_predictions(model, val_loader, device, fold_dir, epoch, use_wandb=use_wandb)
 
             if val_dice > best_dice:
                 best_dice = val_dice
@@ -451,7 +539,7 @@ def train_kfold(args):
                 break
 
         torch.save(model.state_dict(), checkpoint_dir / 'final_model.pth')
-        writer.close()
+        logger.close()
 
         fold_results.append({
             'fold': fold_idx + 1,
@@ -485,6 +573,14 @@ def train_kfold(args):
     }
     with open(output_dir / 'kfold_summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
+
+    # Log summary to wandb
+    if use_wandb:
+        wandb.log({
+            'summary/mean_dice': mean_dice,
+            'summary/std_dice': std_dice
+        })
+        wandb.finish()
 
     return output_dir, mean_dice, std_dice
 
@@ -537,6 +633,12 @@ def get_args():
                         help='Use K-Fold cross-validation')
     parser.add_argument('--n-folds', type=int, default=5,
                         help='Number of folds for cross-validation')
+
+    # Wandb arguments
+    parser.add_argument('--wandb', action='store_true', default=False,
+                        help='Enable wandb logging')
+    parser.add_argument('--wandb-project', type=str, default='ultrasound-segmentation',
+                        help='Wandb project name')
 
     return parser.parse_args()
 
