@@ -22,7 +22,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from PIL import Image
 
-from unet import UNet
+from Models import U_Net
+from Metrics import dice_coeff as numpy_dice_coeff
 from ultrasound_dataset import UltrasoundDataset
 
 
@@ -191,7 +192,7 @@ def compare_models(args):
         logging.info('Evaluating BASELINE model (without augmented data)')
         logging.info('='*50)
 
-        model_baseline = UNet(n_channels=3, n_classes=1, bilinear=args.bilinear)
+        model_baseline = U_Net(in_ch=3, out_ch=1)
         model_baseline.load_state_dict(torch.load(args.baseline_model, map_location=device))
         model_baseline = model_baseline.to(device)
 
@@ -215,7 +216,7 @@ def compare_models(args):
         logging.info('Evaluating AUGMENTED model (with generated data)')
         logging.info('='*50)
 
-        model_augmented = UNet(n_channels=3, n_classes=1, bilinear=args.bilinear)
+        model_augmented = U_Net(in_ch=3, out_ch=1)
         model_augmented.load_state_dict(torch.load(args.augmented_model, map_location=device))
         model_augmented = model_augmented.to(device)
 
@@ -300,8 +301,6 @@ def get_args():
                         help='Output directory for results')
 
     # Model arguments
-    parser.add_argument('--bilinear', action='store_true', default=False,
-                        help='Use bilinear upsampling')
 
     # Evaluation arguments
     parser.add_argument('--batch-size', type=int, default=8,

@@ -22,7 +22,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
-from unet import UNet
+from Models import U_Net
 from ultrasound_dataset import set_seed, get_dataloaders, get_kfold_dataloaders
 
 
@@ -191,7 +191,7 @@ def train(args):
     )
 
     # Create model
-    model = UNet(n_channels=3, n_classes=1, bilinear=args.bilinear)
+    model = U_Net(in_ch=3, out_ch=1)
     model = model.to(device)
 
     # Load pretrained weights if provided
@@ -333,7 +333,7 @@ def train_kfold(args):
         writer = SummaryWriter(fold_dir / 'logs')
 
         # Create model (fresh for each fold)
-        model = UNet(n_channels=3, n_classes=1, bilinear=args.bilinear)
+        model = U_Net(in_ch=3, out_ch=1)
         model = model.to(device)
 
         if args.pretrained:
@@ -438,8 +438,6 @@ def get_args():
                         help='Output directory for checkpoints and logs')
 
     # Model arguments
-    parser.add_argument('--bilinear', action='store_true', default=False,
-                        help='Use bilinear upsampling instead of transposed convolutions')
     parser.add_argument('--pretrained', type=str, default=None,
                         help='Path to pretrained model weights')
 
