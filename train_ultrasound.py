@@ -57,9 +57,19 @@ def create_model(model_name, in_ch=3, out_ch=1):
 
 
 def dice_coeff(pred, target, smooth=1e-6):
-    """Calculate Dice coefficient."""
+    """Calculate Dice coefficient (soft Dice with continuous values)."""
     pred = torch.sigmoid(pred)
     pred_flat = pred.view(-1)
+    target_flat = target.view(-1)
+    intersection = (pred_flat * target_flat).sum()
+    return (2. * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
+
+
+def dice_coeff_binary(pred, target, threshold=0.5, smooth=1e-6):
+    """Calculate Dice coefficient with binary predictions (hard Dice)."""
+    pred = torch.sigmoid(pred)
+    pred_binary = (pred > threshold).float()
+    pred_flat = pred_binary.view(-1)
     target_flat = target.view(-1)
     intersection = (pred_flat * target_flat).sum()
     return (2. * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
@@ -134,11 +144,11 @@ class CSVLogger:
     def __init__(self, log_path):
         self.log_path = Path(log_path)
         self.file = open(self.log_path, 'w')
-        self.file.write('epoch,train_loss,train_dice,val_loss,val_dice,lr\n')
+        self.file.write('epoch,train_loss,train_dice_soft,train_dice_binary,val_loss,val_dice_soft,val_dice_binary,lr\n')
         self.file.flush()
 
-    def log(self, epoch, train_loss, train_dice, val_loss, val_dice, lr):
-        self.file.write(f'{epoch},{train_loss:.6f},{train_dice:.6f},{val_loss:.6f},{val_dice:.6f},{lr:.8f}\n')
+    def log(self, epoch, train_loss, train_dice_soft, train_dice_binary, val_loss, val_dice_soft, val_dice_binary, lr):
+        self.file.write(f'{epoch},{train_loss:.6f},{train_dice_soft:.6f},{train_dice_binary:.6f},{val_loss:.6f},{val_dice_soft:.6f},{val_dice_binary:.6f},{lr:.8f}\n')
         self.file.flush()
 
     def close(self):
@@ -212,7 +222,8 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch):
     """Train for one epoch."""
     model.train()
     total_loss = 0
-    total_dice = 0
+    total_dice_soft = 0
+    total_dice_binary = 0
 
     pbar = tqdm(loader, desc=f'Epoch {epoch} [Train]')
     for batch in pbar:
@@ -238,17 +249,22 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch):
 
         # Calculate metrics
         with torch.no_grad():
-            dice = dice_coeff(outputs, masks)
+            dice_soft = dice_coeff(outputs, masks)
+            dice_binary = dice_coeff_binary(outputs, masks)
 
         total_loss += loss.item()
-        total_dice += dice.item()
+        total_dice_soft += dice_soft.item()
+        total_dice_binary += dice_binary.item()
 
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
-            'dice': f'{dice.item():.4f}'
+            'dice_s': f'{dice_soft.item():.4f}',
+            'dice_b': f'{dice_binary.item():.4f}'
         })
 
-    return total_loss / len(loader), total_dice / len(loader)
+    return (total_loss / len(loader),
+            total_dice_soft / len(loader),
+            total_dice_binary / len(loader))
 
 
 @torch.no_grad()
@@ -256,7 +272,8 @@ def validate(model, loader, criterion, device):
     """Validate the model."""
     model.eval()
     total_loss = 0
-    total_dice = 0
+    total_dice_soft = 0
+    total_dice_binary = 0
 
     for batch in tqdm(loader, desc='Validating'):
         images = batch['image'].to(device)
@@ -266,11 +283,15 @@ def validate(model, loader, criterion, device):
             outputs = model(images)
             loss = criterion(outputs, masks)
 
-        dice = dice_coeff(outputs, masks)
+        dice_soft = dice_coeff(outputs, masks)
+        dice_binary = dice_coeff_binary(outputs, masks)
         total_loss += loss.item()
-        total_dice += dice.item()
+        total_dice_soft += dice_soft.item()
+        total_dice_binary += dice_binary.item()
 
-    return total_loss / len(loader), total_dice / len(loader)
+    return (total_loss / len(loader),
+            total_dice_soft / len(loader),
+            total_dice_binary / len(loader))
 
 
 @torch.no_grad()
@@ -427,31 +448,31 @@ def train(args):
         logging.info(f'Learning rate: {optimizer.param_groups[0]["lr"]:.6f}')
 
         # Train
-        train_loss, train_dice = train_one_epoch(
+        train_loss, train_dice_soft, train_dice_binary = train_one_epoch(
             model, train_loader, criterion, optimizer, scaler, device, epoch
         )
 
         # Validate
-        val_loss, val_dice = validate(model, val_loader, criterion, device)
+        val_loss, val_dice_soft, val_dice_binary = validate(model, val_loader, criterion, device)
 
         # Update scheduler
         scheduler.step()
 
         # Log metrics
-        logging.info(f'Train Loss: {train_loss:.4f}, Train Dice: {train_dice:.4f}')
-        logging.info(f'Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}')
+        logging.info(f'Train Loss: {train_loss:.4f}, Train Dice (soft): {train_dice_soft:.4f}, Train Dice (binary): {train_dice_binary:.4f}')
+        logging.info(f'Val Loss: {val_loss:.4f}, Val Dice (soft): {val_dice_soft:.4f}, Val Dice (binary): {val_dice_binary:.4f}')
 
-        logger.log(epoch, train_loss, train_dice, val_loss, val_dice, optimizer.param_groups[0]['lr'])
+        logger.log(epoch, train_loss, train_dice_soft, train_dice_binary, val_loss, val_dice_soft, val_dice_binary, optimizer.param_groups[0]['lr'])
 
         # Visualize predictions periodically
         if epoch % args.vis_freq == 0 or epoch == 1:
             visualize_predictions(model, val_loader, device, output_dir, epoch)
 
-        # Save best model
-        if val_dice > best_dice:
-            best_dice = val_dice
+        # Save best model (use binary dice for model selection)
+        if val_dice_binary > best_dice:
+            best_dice = val_dice_binary
             torch.save(model.state_dict(), checkpoint_dir / 'best_model.pth')
-            logging.info(f'New best model saved! Dice: {best_dice:.4f}')
+            logging.info(f'New best model saved! Binary Dice: {best_dice:.4f}')
 
         # Save periodic checkpoint
         if epoch % args.save_freq == 0:
@@ -463,8 +484,8 @@ def train(args):
                 'best_dice': best_dice,
             }, checkpoint_dir / f'checkpoint_epoch_{epoch}.pth')
 
-        # Early stopping check
-        if early_stopping(val_dice):
+        # Early stopping check (use binary dice)
+        if early_stopping(val_dice_binary):
             logging.info(f'Early stopping triggered at epoch {epoch}')
             break
 
@@ -572,28 +593,28 @@ def train_kfold(args):
         for epoch in range(1, args.epochs + 1):
             logging.info(f'\nFold {fold_idx + 1} - Epoch {epoch}/{args.epochs}')
 
-            train_loss, train_dice = train_one_epoch(
+            train_loss, train_dice_soft, train_dice_binary = train_one_epoch(
                 model, train_loader, criterion, optimizer, scaler, device, epoch
             )
-            val_loss, val_dice = validate(model, val_loader, criterion, device)
+            val_loss, val_dice_soft, val_dice_binary = validate(model, val_loader, criterion, device)
 
             scheduler.step()
 
-            logging.info(f'Train Loss: {train_loss:.4f}, Train Dice: {train_dice:.4f}')
-            logging.info(f'Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}')
+            logging.info(f'Train Loss: {train_loss:.4f}, Train Dice (soft): {train_dice_soft:.4f}, Train Dice (binary): {train_dice_binary:.4f}')
+            logging.info(f'Val Loss: {val_loss:.4f}, Val Dice (soft): {val_dice_soft:.4f}, Val Dice (binary): {val_dice_binary:.4f}')
 
-            logger.log(epoch, train_loss, train_dice, val_loss, val_dice, optimizer.param_groups[0]['lr'])
+            logger.log(epoch, train_loss, train_dice_soft, train_dice_binary, val_loss, val_dice_soft, val_dice_binary, optimizer.param_groups[0]['lr'])
 
             # Visualize predictions periodically
             if epoch % args.vis_freq == 0 or epoch == 1:
                 visualize_predictions(model, val_loader, device, fold_dir, epoch)
 
-            if val_dice > best_dice:
-                best_dice = val_dice
+            if val_dice_binary > best_dice:
+                best_dice = val_dice_binary
                 torch.save(model.state_dict(), checkpoint_dir / 'best_model.pth')
-                logging.info(f'New best model for fold {fold_idx + 1}! Dice: {best_dice:.4f}')
+                logging.info(f'New best model for fold {fold_idx + 1}! Binary Dice: {best_dice:.4f}')
 
-            if early_stopping(val_dice):
+            if early_stopping(val_dice_binary):
                 logging.info(f'Early stopping triggered at epoch {epoch}')
                 break
 
