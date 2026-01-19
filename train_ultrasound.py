@@ -23,8 +23,37 @@ from torch.amp.autocast_mode import autocast
 from tqdm import tqdm
 import torchvision.utils as vutils
 
-from Models import U_Net
+from Models import U_Net, R2U_Net, AttU_Net, R2AttU_Net, NestedUNet
 from ultrasound_dataset import set_seed, get_dataloaders, get_kfold_dataloaders
+
+
+def create_model(model_name, in_ch=3, out_ch=1):
+    """Create a UNet model based on the specified name.
+
+    Args:
+        model_name: Name of the model architecture
+        in_ch: Number of input channels (default: 3 for RGB)
+        out_ch: Number of output channels (default: 1 for binary segmentation)
+
+    Returns:
+        model: The instantiated model
+    """
+    model_name = model_name.lower()
+
+    if model_name == 'unet':
+        model = U_Net(in_ch=in_ch, out_ch=out_ch)
+    elif model_name == 'r2unet':
+        model = R2U_Net(img_ch=in_ch, output_ch=out_ch, t=2)
+    elif model_name == 'attunet':
+        model = AttU_Net(img_ch=in_ch, output_ch=out_ch)
+    elif model_name == 'r2attunet':
+        model = R2AttU_Net(in_ch=in_ch, out_ch=out_ch, t=2)
+    elif model_name == 'nestedunet':
+        model = NestedUNet(in_ch=in_ch, out_ch=out_ch)
+    else:
+        raise ValueError(f"Unknown model: {model_name}. Choose from: unet, r2unet, attunet, r2attunet, nestedunet")
+
+    return model
 
 
 def dice_coeff(pred, target, smooth=1e-6):
@@ -59,15 +88,26 @@ class CombinedLoss(nn.Module):
 class EarlyStopping:
     """Early stopping to prevent overfitting."""
 
-    def __init__(self, patience=10, min_delta=0.001, mode='max'):
+    def __init__(self, patience=10, min_delta=0.001, mode='max', min_epochs=20):
         self.patience = patience
         self.min_delta = min_delta
         self.mode = mode
+        self.min_epochs = min_epochs  # Minimum epochs before early stopping can trigger
         self.counter = 0
         self.best_score = None
         self.early_stop = False
+        self.current_epoch = 0
 
     def __call__(self, score):
+        self.current_epoch += 1
+
+        # Don't trigger early stopping before min_epochs
+        if self.current_epoch < self.min_epochs:
+            if self.best_score is None or (self.mode == 'max' and score > self.best_score) or \
+               (self.mode == 'min' and score < self.best_score):
+                self.best_score = score
+            return False
+
         if self.best_score is None:
             self.best_score = score
             return False
@@ -233,6 +273,74 @@ def validate(model, loader, criterion, device):
     return total_loss / len(loader), total_dice / len(loader)
 
 
+@torch.no_grad()
+def evaluate_test_set(model, test_loader, criterion, device, output_dir):
+    """Evaluate model on test set and save results."""
+    model.eval()
+    total_loss = 0
+    total_dice = 0
+    sample_results = []
+
+    logging.info('\n' + '=' * 50)
+    logging.info('Evaluating on Test Set')
+    logging.info('=' * 50)
+
+    for batch in tqdm(test_loader, desc='Testing'):
+        images = batch['image'].to(device)
+        masks = batch['mask'].to(device)
+
+        with autocast('cuda', enabled=True):
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+
+        # Calculate per-sample dice scores
+        preds = torch.sigmoid(outputs)
+        for i in range(images.size(0)):
+            pred_flat = preds[i].view(-1)
+            target_flat = masks[i].view(-1)
+            intersection = (pred_flat * target_flat).sum()
+            sample_dice = (2. * intersection + 1e-6) / (pred_flat.sum() + target_flat.sum() + 1e-6)
+            sample_results.append(sample_dice.item())
+
+        dice = dice_coeff(outputs, masks)
+        total_loss += loss.item()
+        total_dice += dice.item()
+
+    avg_loss = total_loss / len(test_loader)
+    avg_dice = total_dice / len(test_loader)
+
+    # Calculate statistics
+    import numpy as np
+    sample_results = np.array(sample_results)
+    std_dice = np.std(sample_results)
+    min_dice = np.min(sample_results)
+    max_dice = np.max(sample_results)
+
+    logging.info(f'Test Loss: {avg_loss:.4f}')
+    logging.info(f'Test Dice: {avg_dice:.4f} +/- {std_dice:.4f}')
+    logging.info(f'Test Dice Range: [{min_dice:.4f}, {max_dice:.4f}]')
+    logging.info(f'Number of test samples: {len(sample_results)}')
+
+    # Save test results
+    test_results = {
+        'test_loss': avg_loss,
+        'test_dice_mean': avg_dice,
+        'test_dice_std': float(std_dice),
+        'test_dice_min': float(min_dice),
+        'test_dice_max': float(max_dice),
+        'num_samples': len(sample_results),
+        'per_sample_dice': sample_results.tolist()
+    }
+
+    import json
+    with open(output_dir / 'test_results.json', 'w') as f:
+        json.dump(test_results, f, indent=2)
+
+    logging.info(f'Test results saved to {output_dir / "test_results.json"}')
+
+    return avg_loss, avg_dice
+
+
 def train(args):
     """Main training function."""
     # Setup logging
@@ -262,7 +370,7 @@ def train(args):
     logging.info(f'Training directories: {train_dirs}')
 
     # Create dataloaders
-    train_loader, val_loader, _ = get_dataloaders(
+    train_loader, val_loader, test_loader = get_dataloaders(
         train_dirs=train_dirs,
         test_dir=args.test_dir,
         img_size=(args.img_size, args.img_size),
@@ -273,7 +381,8 @@ def train(args):
     )
 
     # Create model
-    model = U_Net(in_ch=3, out_ch=1)
+    logging.info(f'Creating model: {args.model}')
+    model = create_model(args.model, in_ch=3, out_ch=1)
     model = model.to(device)
 
     # Load pretrained weights if provided
@@ -282,6 +391,7 @@ def train(args):
         state_dict = torch.load(args.pretrained, map_location=device)
         model.load_state_dict(state_dict)
 
+    logging.info(f'Model: {args.model}')
     logging.info(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
 
     # Setup optimizer and scheduler
@@ -307,7 +417,7 @@ def train(args):
     scaler = GradScaler('cuda') if args.amp and device.type == 'cuda' else None
 
     # Early stopping
-    early_stopping = EarlyStopping(patience=args.patience, mode='max')
+    early_stopping = EarlyStopping(patience=args.patience, mode='max', min_epochs=args.min_epochs)
 
     # Training loop
     best_dice = 0
@@ -365,7 +475,16 @@ def train(args):
     logging.info(f'\nTraining completed! Best validation Dice: {best_dice:.4f}')
     logging.info(f'Results saved to: {output_dir}')
 
-    return output_dir, best_dice
+    # Evaluate on test set using best model
+    if test_loader is not None:
+        logging.info('\nLoading best model for test evaluation...')
+        model.load_state_dict(torch.load(checkpoint_dir / 'best_model.pth', map_location=device))
+        _, test_dice = evaluate_test_set(model, test_loader, criterion, device, output_dir)
+    else:
+        logging.info('No test loader available, skipping test evaluation.')
+        test_dice = None
+
+    return output_dir, best_dice, test_dice
 
 
 def train_kfold(args):
@@ -392,9 +511,10 @@ def train_kfold(args):
     logging.info(f'Running {args.n_folds}-fold cross-validation')
 
     fold_results = []
+    test_loader = None  # Will be set from the first fold
 
     # K-Fold training
-    for fold_idx, train_loader, val_loader, _ in get_kfold_dataloaders(
+    for fold_idx, train_loader, val_loader, test_loader_fold in get_kfold_dataloaders(
         train_dirs=train_dirs,
         test_dir=args.test_dir,
         n_folds=args.n_folds,
@@ -403,6 +523,8 @@ def train_kfold(args):
         num_workers=args.num_workers,
         seed=args.seed
     ):
+        if test_loader is None:
+            test_loader = test_loader_fold
         logging.info(f'\n{"="*60}')
         logging.info(f'FOLD {fold_idx + 1}/{args.n_folds}')
         logging.info(f'{"="*60}')
@@ -418,7 +540,7 @@ def train_kfold(args):
         logger = CSVLogger(fold_dir / 'training_log.csv')
 
         # Create model (fresh for each fold)
-        model = U_Net(in_ch=3, out_ch=1)
+        model = create_model(args.model, in_ch=3, out_ch=1)
         model = model.to(device)
 
         if args.pretrained:
@@ -443,7 +565,7 @@ def train_kfold(args):
 
         criterion = CombinedLoss(bce_weight=0.5, dice_weight=0.5)
         scaler = GradScaler('cuda') if args.amp and device.type == 'cuda' else None
-        early_stopping = EarlyStopping(patience=args.patience, mode='max')
+        early_stopping = EarlyStopping(patience=args.patience, mode='max', min_epochs=args.min_epochs)
 
         # Training loop for this fold
         best_dice = 0
@@ -511,6 +633,32 @@ def train_kfold(args):
     with open(output_dir / 'kfold_summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
 
+    # Evaluate on test set using the best model from the best fold
+    test_dice = None
+    if test_loader is not None:
+        # Find the best fold
+        best_fold_idx = max(range(len(fold_results)), key=lambda i: fold_results[i]['best_dice'])
+        best_fold = fold_results[best_fold_idx]
+        best_fold_dir = output_dir / f'fold_{best_fold["fold"]}'
+
+        logging.info(f'\nLoading best model from fold {best_fold["fold"]} for test evaluation...')
+
+        # Load best model from best fold
+        model = create_model(args.model, in_ch=3, out_ch=1)
+        model = model.to(device)
+        model.load_state_dict(torch.load(best_fold_dir / 'checkpoints' / 'best_model.pth', map_location=device))
+
+        criterion = CombinedLoss(bce_weight=0.5, dice_weight=0.5)
+        _, test_dice = evaluate_test_set(model, test_loader, criterion, device, output_dir)
+
+        # Update summary with test results
+        summary['test_dice'] = test_dice
+        summary['best_fold_for_test'] = best_fold['fold']
+        with open(output_dir / 'kfold_summary.json', 'w') as f:
+            json.dump(summary, f, indent=2)
+    else:
+        logging.info('No test loader available, skipping test evaluation.')
+
     return output_dir, mean_dice, std_dice
 
 
@@ -526,6 +674,9 @@ def get_args():
                         help='Output directory for checkpoints and logs')
 
     # Model arguments
+    parser.add_argument('--model', type=str, default='unet',
+                        choices=['unet', 'r2unet', 'attunet', 'r2attunet', 'nestedunet'],
+                        help='Model architecture: unet (basic), r2unet (recurrent), attunet (attention), r2attunet (recurrent+attention), nestedunet (unet++)')
     parser.add_argument('--pretrained', type=str, default=None,
                         help='Path to pretrained model weights')
 
@@ -562,6 +713,10 @@ def get_args():
                         help='Use K-Fold cross-validation')
     parser.add_argument('--n-folds', type=int, default=5,
                         help='Number of folds for cross-validation')
+
+    # Early stopping
+    parser.add_argument('--min-epochs', type=int, default=20,
+                        help='Minimum epochs before early stopping can trigger')
 
     return parser.parse_args()
 
